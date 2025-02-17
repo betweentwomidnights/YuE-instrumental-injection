@@ -1,0 +1,11 @@
+python inpainting.py \
+  --input_audio_path adam_ldt.wav \
+  --lyrics_file lyrics.txt \
+  --genre_file genre.txt \
+  --model_path m-a-p/YuE-s1-7B-anneal-en-cot \
+  --stage2_model_path m-a-p/YuE-s2-1B-general \
+  --codec_config ./xcodec_mini_infer/final_ckpt/config.yaml \
+  --codec_checkpoint ./xcodec_mini_infer/final_ckpt/ckpt_00360000.pth \
+  --config_path ./xcodec_mini_infer/decoders/config.yaml \
+  --vocal_decoder_path ./xcodec_mini_infer/decoders/decoder_131000.pth \
+  --inst_decoder_path ./xcodec_mini_infer/decoders/decoder_151000.pth
