@@ -154,6 +154,13 @@ def crop_audio_to_60_seconds(audio_path, output_path=None):
     
     return output_path
 
+GENERATION_PARAMS = {
+    "max_new_tokens": 2000,
+    "temperature": 1.0,
+    "top_p": 0.93,
+    "repetition_penalty": 1.2,
+}
+
 ### Generation Function with Explicit Segmentation ###
 def generate_with_segments(
     model,
@@ -164,27 +171,22 @@ def generate_with_segments(
     instrument_codes,
     device,
     run_n_segments,
-    max_new_tokens=2000,
-    temperature=1.0,
-    top_p=0.93,
-    repetition_penalty=1.2
+    generation_params,  # Consolidated generation parameters dictionary
 ):
-    """
-    Generate vocals segment by segment while enforcing instrument tokens.
-    If there is more than one lyric section, the first prompt is the full context (all lyrics)
-    and subsequent prompts are individual segments.
-    If there's only one section, then the prompt is simply the full context.
-    """
+    # Extract generation parameters from the dictionary.
+    max_new_tokens = generation_params.get("max_new_tokens", 2000)
+    temperature = generation_params.get("temperature", 1.0)
+    top_p = generation_params.get("top_p", 0.93)
+    repetition_penalty = generation_params.get("repetition_penalty", 1.2)
+
     print("\nStarting segmented generation...")
 
+    # Build prompt texts based on the number of lyric segments.
     if len(lyrics_segments) > 1:
-        # Combine all lyric sections for full context.
         full_lyrics = "\n".join(lyrics_segments)
         full_context = f"Generate music from the given lyrics segment by segment.\n[Genre] {genres}\n{full_lyrics}"
-        # Use the full context as the setup iteration, then each individual section.
         prompt_texts = [full_context] + lyrics_segments
     else:
-        # Only one section: just use it.
         full_context = f"Generate music from the given lyrics segment by segment.\n[Genre] {genres}\n{lyrics_segments[0]}"
         prompt_texts = [full_context]
 
@@ -199,29 +201,22 @@ def generate_with_segments(
     raw_output = None
 
     total_instrument_tokens = len(instrument_codes)
-    # If there are multiple segments, divide tokens among them;
-    # otherwise, use all instrument tokens.
     if len(lyrics_segments) > 1:
         tokens_per_segment = total_instrument_tokens // (len(lyrics_segments))
     else:
         tokens_per_segment = total_instrument_tokens
+
     print("\nSegment Distribution:")
     print(f"Total instrument tokens: {total_instrument_tokens}")
     print(f"Tokens per segment: {tokens_per_segment}")
-    print(f"Number of segments (excluding context): {len(lyrics_segments) if len(lyrics_segments)>1 else 1}")
+    print(f"Number of segments (excluding context): {len(lyrics_segments) if len(lyrics_segments) > 1 else 1}")
 
-    # Determine how many iterations to run.
-    if len(prompt_texts) > 1:
-        run_n = min(run_n_segments + 1, len(prompt_texts))
-    else:
-        run_n = 1  # Only one prompt if there's a single section
+    run_n = min(run_n_segments + 1, len(prompt_texts)) if len(prompt_texts) > 1 else 1
 
     for i in range(run_n):
         print(f"\nProcessing iteration {i}/{run_n - 1}")
-        # Remove any segment markers from the current text.
         section_text = prompt_texts[i].replace('[start_of_segment]', '').replace('[end_of_segment]', '')
 
-        # If there are multiple prompts, use iteration 0 as the setup (full context).
         if len(prompt_texts) > 1 and i == 0:
             print("Setup iteration: saving context.")
             continue
@@ -231,21 +226,14 @@ def generate_with_segments(
         end_idx = start_idx + tokens_per_segment if i < run_n - 1 else total_instrument_tokens
         print(f"Token range for segment {segment_idx}: {start_idx} to {end_idx}")
 
-        # Build the prompt.
         if i == 0 or (len(prompt_texts) == 1):
-            # If only one prompt is present, use it entirely.
             head_tokens = mmtokenizer.tokenize(prompt_texts[0])
-            # (No need to append a duplicate stage marker)
             prompt_ids = head_tokens + start_of_segment + mmtokenizer.tokenize(section_text) + [mmtokenizer.soa] + codectool.sep_ids
             prompt_ids = torch.as_tensor(prompt_ids).unsqueeze(0).to(device)
         else:
-            # For subsequent segments (when more than one prompt exists), use the context from the previous output.
             new_segment = end_of_segment + start_of_segment + mmtokenizer.tokenize(section_text) + [mmtokenizer.soa] + codectool.sep_ids
             new_segment = torch.as_tensor(new_segment).unsqueeze(0).to(device)
-            if raw_output is not None:
-                prompt_ids = torch.cat([raw_output, new_segment], dim=1)
-            else:
-                prompt_ids = new_segment
+            prompt_ids = torch.cat([raw_output, new_segment], dim=1) if raw_output is not None else new_segment
 
         print(f"Segment {segment_idx} prompt length: {prompt_ids.shape[1]}")
         print(f"Current segment lyrics:\n{section_text}")
@@ -254,7 +242,6 @@ def generate_with_segments(
         segment_tokens = []
 
         try:
-            # For each expected instrument token in the segment, generate a vocal token and force an instrument token.
             for t in tqdm(range(start_idx, end_idx), desc=f"Segment {segment_idx} Generation"):
                 with torch.no_grad():
                     outputs = model(current_input)
@@ -266,18 +253,12 @@ def generate_with_segments(
                     vocal_token = next_token[0].item()
 
                 segment_tokens.append(vocal_token)
-
-                # Force in the corresponding instrument token.
                 inst_token = int(instrument_codes[t])
-                # Adjust instrument token arithmetic as needed.
                 inst_token = (inst_token % 1024) + 45334 + 1024
                 segment_tokens.append(inst_token)
-
-                # Update the context with the new pair.
                 token_pair = torch.tensor([[vocal_token, inst_token]], device=device)
                 current_input = torch.cat([current_input, token_pair], dim=1)
 
-                # Maintain context window limits.
                 if current_input.shape[1] > 16000:
                     current_input = current_input[:, -8000:]
 
@@ -292,22 +273,16 @@ def generate_with_segments(
             if len(segment_tokens) == 0:
                 raise Exception(f"No tokens generated for segment {segment_idx}")
 
-        # Append the <EOA> token at the end of the final segment.
         if i == run_n - 1:
             segment_tokens.append(mmtokenizer.eoa)
             eoa_tensor = torch.tensor([[mmtokenizer.eoa]], device=device)
             current_input = torch.cat([current_input, eoa_tensor], dim=1)
 
-        # Update raw_output for subsequent segments.
-        if i == 1 or (len(prompt_texts) == 1):
-            raw_output = current_input
-        else:
-            raw_output = torch.cat([raw_output, current_input[:, prompt_ids.shape[1]:]], dim=1)
-
+        raw_output = current_input if i == 1 or (len(prompt_texts) == 1) else torch.cat([raw_output, current_input[:, prompt_ids.shape[1]:]], dim=1)
         all_tokens.extend(segment_tokens)
         print(f"\nSegment {segment_idx} complete - Generated {len(segment_tokens)//2} token pairs")
 
-    # Validate that the SOA and EOA tokens are paired correctly.
+    # Validate SOA and EOA pairing.
     ids = raw_output[0].cpu().numpy()
     soa_idx = np.where(ids == mmtokenizer.soa)[0].tolist()
     eoa_idx = np.where(ids == mmtokenizer.eoa)[0].tolist()
@@ -429,12 +404,7 @@ def main(
     run_n_segments = min(run_n_segments + 1, len(lyrics_segments))
     lyrics_segments = lyrics_segments[:run_n_segments]
     
-    generation_params = {
-        'max_new_tokens': 2000,
-        'temperature': 1.0,
-        'top_p': 0.93,
-        'repetition_penalty': 1.2,
-    }
+    generation_params = GENERATION_PARAMS  # Use the centralized dictionary
     
     final_tokens = generate_with_segments(
         model=model,
@@ -445,7 +415,7 @@ def main(
         instrument_codes=instrument_codes,
         device=device,
         run_n_segments=run_n_segments,
-        **generation_params
+        generation_params=generation_params  # Pass the parameters as a single object
     )
     
     stage1_output_set = save_generated_tokens(
